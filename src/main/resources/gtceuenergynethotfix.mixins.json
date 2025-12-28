@@ -1,0 +1,13 @@
+{
+  "required": true,
+  "minVersion": "0.8",
+  "package": "your.mod.mixin",
+  "compatibilityLevel": "JAVA_17",
+  "refmap": "gtceuenergynethotfix.refmap.json",
+  "mixins": [
+    "EnergyNetHandlerMixin",
+    "EnergyNetMixin"
+  ],
+  "client": [],
+  "server": []
+}

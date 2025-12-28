@@ -1,0 +1,17 @@
+modLoader="javafml"
+loaderVersion="[47,)"
+license="MIT"
+
+[[mods]]
+modId="gtceuenergynethotfix"
+version="1.0.0"
+displayName="GTCEu EnergyNet Hotfix"
+description="Correctness-preserving optimization for GTCEu energy nets: per-net per-tick sink caching."
+mixinConfigs="gtceuenergynethotfix.mixins.json"
+
+[[dependencies.gtceuenergynethotfix]]
+modId="forge"
+mandatory=true
+versionRange="[47,)"
+ordering="NONE"
+side="SERVER"
