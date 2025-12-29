@@ -77,6 +77,17 @@ public abstract class EnergyNetHandlerMixin {
             );
 
             if (accepted > 0) {
+                // Preserve GTCEu cable statistics (Jade/WTHIT/TOP live amperage) and over-amp heat behavior.
+                //
+                // Server-side mitigation for remote-client stutter:
+                // - Batch per-segment accounting once per tick (instead of per-transfer).
+                // - Skip tooltip-visible counter updates when no players are nearby, while keeping heat/burn safety correct.
+                long voltageTraveled = voltage;
+                for (com.gregtechceu.gtceu.common.blockentity.CableBlockEntity seg : path.getPath()) {
+                    voltageTraveled -= seg.getNodeData().getLossPerBlock();
+                    if (voltageTraveled <= 0) break;
+                    your.mod.energy.CableAmperageAccumulator.record(level, seg, accepted, voltageTraveled);
+                }
                 sink.remainingAmps -= accepted;
                 remaining -= accepted;
                 acceptedTotal += accepted;
