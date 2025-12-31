@@ -152,6 +152,7 @@ Writing Output: C:\Users\henry\Desktop\minecraft_mods_source\gtceu_routecache_ho
   your/mod/energy/CableAmperageAccumulator$Entry.class
   your/mod/energy/CableAmperageAccumulator.class
   your/mod/energy/EndpointChangeTracker.class
+  your/mod/energy/FeEnergyContainerWrapper.class
   your/mod/energy/HandlerCache$Cached.class
   your/mod/energy/HandlerCache$PerNet.class
   your/mod/energy/HandlerCache.class
@@ -159,5 +160,9 @@ Writing Output: C:\Users\henry\Desktop\minecraft_mods_source\gtceu_routecache_ho
   your/mod/energy/SinkCache.class
   your/mod/energy/SinkState.class
   your/mod/mixin/
+  your/mod/mixin/CableBlockMixin.class
+  your/mod/mixin/EUToFEGTEnergyWrapperMixin.class
   your/mod/mixin/EnergyNetHandlerMixin.class
   your/mod/mixin/EnergyNetMixin.class
+  your/mod/mixin/EnergyNetWalkerMixin.class
+  your/mod/mixin/GTCapabilityHelperMixin.class

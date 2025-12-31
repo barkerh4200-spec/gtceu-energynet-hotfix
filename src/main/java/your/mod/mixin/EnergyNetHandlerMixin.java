@@ -19,6 +19,8 @@ import java.util.List;
 @Mixin(value = EnergyNetHandler.class, remap = false)
 public abstract class EnergyNetHandlerMixin {
 
+
+    @org.spongepowered.asm.mixin.Unique private static boolean HOTFIX_LOG_ENERGYNET_HANDLER = false;
     @Shadow private EnergyNet net;
     @Shadow private CableBlockEntity cable;
 
@@ -32,9 +34,14 @@ public abstract class EnergyNetHandlerMixin {
      */
     @Overwrite(remap = false)
     public long acceptEnergyFromNetwork(Direction side, long voltage, long amperage) {
+        if (!HOTFIX_LOG_ENERGYNET_HANDLER) {
+            HOTFIX_LOG_ENERGYNET_HANDLER = true;
+            org.apache.logging.log4j.LogManager.getLogger("GTCEuEnergyNetHotfix").info("Mixin active: EnergyNetHandlerMixin (endpoint caching + delivery)");
+        }
+
         if (!GTCEU_ENERGYNET_HOTFIX_LOGGED) {
             GTCEU_ENERGYNET_HOTFIX_LOGGED = true;
-            System.out.println("[GTCEuEnergyNetHotfix] EnergyNetHandler.acceptEnergyFromNetwork OVERWRITE ACTIVE");
+            org.apache.logging.log4j.LogManager.getLogger("GTCEuEnergyNetHotfix").info("[GTCEuEnergyNetHotfix] EnergyNetHandler.acceptEnergyFromNetwork OVERWRITE ACTIVE");
         }
 
         if (amperage <= 0 || net == null || cable == null) {

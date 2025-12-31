@@ -6,7 +6,11 @@
   "refmap": "gtceuenergynethotfix.refmap.json",
   "mixins": [
     "EnergyNetHandlerMixin",
-    "EnergyNetMixin"
+    "EnergyNetMixin",
+    "GTCapabilityHelperMixin",
+    "EnergyNetWalkerMixin",
+    "CableBlockMixin",
+    "EUToFEGTEnergyWrapperMixin"
   ],
   "client": [],
   "server": []
