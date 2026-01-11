@@ -1,108 +1,96 @@
 package your.mod.energy;
 
 import com.gregtechceu.gtceu.common.blockentity.CableBlockEntity;
-import net.minecraft.core.BlockPos;
+import it.unimi.dsi.fastutil.longs.Long2LongOpenHashMap;
+import it.unimi.dsi.fastutil.objects.Object2ObjectOpenHashMap;
 import net.minecraft.server.level.ServerLevel;
-import net.minecraft.world.level.Level;
 import net.minecraftforge.event.TickEvent;
 import net.minecraftforge.eventbus.api.SubscribeEvent;
 import net.minecraftforge.fml.common.Mod;
 
-import java.util.HashMap;
-import java.util.Map;
-
 /**
- * Tick-batched cable amperage accounting.
+ * Accumulates per-cable amperage updates during EnergyNet delivery and applies them once per server tick.
  *
- * Goals:
- *  - Keep GTCEu safety correct (heat/burn) even if we reduce tooltip-visible updates.
- *  - Reduce per-transfer/per-segment work by batching to once per tick per cable segment.
- *  - Avoid remote-client stutter by skipping tooltip-visible counter updates when no players are nearby.
- *
- * Implementation:
- *  - During energy transfer, record (sumAmps, maxVoltage) per cable segment for the current tick.
- *  - At END of server tick, flush each segment:
- *      * If players nearby: call CableBlockEntity.incrementAmperage(sumAmps, maxVoltage) once.
- *      * If no players nearby: apply heat based on sumAmps vs maxAmperage (safety) but do not touch tooltip counters.
+ * Performance notes:
+ * - Uses primitive fastutil maps to avoid allocation-heavy java.util.HashMap hot paths.
+ * - Packs (sumAmps,maxVoltage) into a single long to keep one map lookup per cable.
  */
 @Mod.EventBusSubscriber(modid = "gtceuenergynethotfix", bus = Mod.EventBusSubscriber.Bus.FORGE)
 public final class CableAmperageAccumulator {
 
     private CableAmperageAccumulator() {}
 
-    /** Per-level map: cablePos.asLong -> aggregated amps/voltage for the current tick. */
-    private static final Map<ServerLevel, Map<Long, Entry>> PER_LEVEL = new HashMap<>();
+    /**
+     * Per-level accumulator: cablePosLong -> packed(sumAmps, maxVoltage).
+     *
+     * packed = (sumAmps << 32) | (maxVoltage & 0xFFFFFFFF)
+     */
+    private static final Object2ObjectOpenHashMap<ServerLevel, Long2LongOpenHashMap> PER_LEVEL = new Object2ObjectOpenHashMap<>();
 
-    /** Radius within which tooltip-visible updates are worth doing. */
-    private static final double PLAYER_RADIUS = 64.0;
+    /**
+     * Record flow through a cable segment for this tick.
+     */
+    public static void record(ServerLevel level, long cablePosLong, long amperage, long voltage) {
+        if (amperage <= 0) return;
 
-    private static final class Entry {
-        final long posLong;
-        long sumAmps;
-        long maxVoltage;
-
-        Entry(long posLong, long amps, long voltage) {
-            this.posLong = posLong;
-            this.sumAmps = amps;
-            this.maxVoltage = voltage;
+        // Lazily create and reuse the per-level map.
+        Long2LongOpenHashMap map = PER_LEVEL.get(level);
+        if (map == null) {
+            map = new Long2LongOpenHashMap(4096);
+            map.defaultReturnValue(0L);
+            PER_LEVEL.put(level, map);
         }
 
-        void add(long amps, long voltage) {
-            this.sumAmps += amps;
-            if (voltage > this.maxVoltage) this.maxVoltage = voltage;
-        }
-    }
+        final long key = cablePosLong;
+        final long packed = map.get(key);
 
-    public static void record(Level level, CableBlockEntity cable, long amps, long voltage) {
-        if (!(level instanceof ServerLevel serverLevel)) return;
-        if (amps <= 0 || voltage <= 0) return;
-        if (cable == null || cable.isRemoved() || cable.isInValid()) return;
+        // Unpack current values.
+        int sumAmps = (int) (packed >>> 32);
+        int maxV = (int) packed;
 
-        long key = cable.getBlockPos().asLong();
-        Map<Long, Entry> map = PER_LEVEL.computeIfAbsent(serverLevel, l -> new HashMap<>());
-        Entry e = map.get(key);
-        if (e == null) {
-            map.put(key, new Entry(key, amps, voltage));
-        } else {
-            e.add(amps, voltage);
-        }
+        // Update.
+        // Amperage is small in GTCEu (typically <= 64), but keep it as int to avoid long math here.
+        sumAmps += (int) amperage;
+
+        final int v = (int) voltage;
+        if (v > maxV) maxV = v;
+
+        map.put(key, (((long) sumAmps) << 32) | (maxV & 0xFFFFFFFFL));
     }
 
     @SubscribeEvent
     public static void onServerTick(TickEvent.ServerTickEvent event) {
         if (event.phase != TickEvent.Phase.END) return;
 
-        for (Map.Entry<ServerLevel, Map<Long, Entry>> lvlEntry : PER_LEVEL.entrySet()) {
-            ServerLevel level = lvlEntry.getKey();
-            Map<Long, Entry> entries = lvlEntry.getValue();
-            if (entries.isEmpty()) continue;
+        if (PER_LEVEL.isEmpty()) return;
 
-            for (Entry e : entries.values()) {
-                BlockPos pos = BlockPos.of(e.posLong);
-                var be = level.getBlockEntity(pos);
+        // Apply and clear each level map in-place (reuse allocations).
+        for (var entry : PER_LEVEL.object2ObjectEntrySet()) {
+            final ServerLevel level = entry.getKey();
+            final Long2LongOpenHashMap map = entry.getValue();
+            if (map == null || map.isEmpty()) continue;
+
+            final var it = map.long2LongEntrySet().fastIterator();
+            while (it.hasNext()) {
+                final var e = it.next();
+                final long posLong = e.getLongKey();
+                final long packed = e.getLongValue();
+                final int sumAmps = (int) (packed >>> 32);
+                final int maxV = (int) packed;
+
+                if (sumAmps <= 0) continue;
+
+                final var be = level.getBlockEntity(net.minecraft.core.BlockPos.of(posLong));
                 if (!(be instanceof CableBlockEntity cable)) continue;
-                if (cable.isRemoved() || cable.isInValid()) continue;
 
-                boolean playerNear = level.hasNearbyAlivePlayer(
-                        pos.getX() + 0.5,
-                        pos.getY() + 0.5,
-                        pos.getZ() + 0.5,
-                        PLAYER_RADIUS
-                );
-
-                if (playerNear) {
-                    // One update per tick per cable: keeps GTCEu tooltip semantics stable.
-                    cable.incrementAmperage(e.sumAmps, e.maxVoltage);
-                } else {
-                    // Safety-only path: preserve heating behavior without touching tooltip counters.
-                    long dif = e.sumAmps - cable.getMaxAmperage();
-                    if (dif > 0) {
-                        cable.applyHeat((int) Math.min(Integer.MAX_VALUE, dif * 40L));
-                    }
-                }
+                // GTCEu 7.4.0:
+                //   boolean incrementAmperage(long amperage, long voltage)
+                // NOTE: CableBlockEntity.incrementAmperage() already applies over-amp heat internally
+                // when the cable exceeds its max amperage for the tick. Calling applyHeat() again here
+                // would double-apply heat and make cables burn incorrectly.
+                cable.incrementAmperage((long) sumAmps, (long) maxV);
             }
-
-            entries.clear();
+            map.clear();
         }
     }
 }

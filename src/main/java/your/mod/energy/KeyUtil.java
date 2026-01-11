@@ -6,6 +6,11 @@ import net.minecraft.core.Direction;
 public final class KeyUtil {
     private KeyUtil() {}
 
+    /** Pack a BlockPos into the upper bits used by {@link #packPosSide(BlockPos, Direction)}. */
+    public static long packPos(BlockPos pos) {
+        return (pos.asLong() << 3);
+    }
+
     /** Pack a BlockPos + Direction into a single long key. */
     public static long packPosSide(BlockPos pos, Direction side) {
         // BlockPos.asLong uses 26/12/26 bits; shift left by 3 to store side (0-5).

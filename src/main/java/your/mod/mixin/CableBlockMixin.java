@@ -17,7 +17,6 @@ import javax.annotation.Nullable;
 public abstract class CableBlockMixin {
 
     private static boolean LOGGED = false;
-    private static boolean UNSIDED_FALLBACK_LOGGED = false;
 
     /**
      * Gate FE capability probes behind "face not blocked" so we only check explicitly enabled faces.
@@ -30,13 +29,6 @@ public abstract class CableBlockMixin {
 @Overwrite
 public boolean canPipeConnectToBlock(IPipeNode<Insulation, WireProperties> selfTile, Direction side,
                                            @Nullable BlockEntity tile) {
-
-        if (!LOGGED) {
-            LOGGED = true;
-            org.apache.logging.log4j.LogManager.getLogger("GTCEuEnergyNetHotfix")
-                    .info("CableBlockMixin active");
-        }
-
         // "output-enabled" == "not blocked"
         if (selfTile.isBlocked(side)) {
             return false;
@@ -57,16 +49,7 @@ public boolean canPipeConnectToBlock(IPipeNode<Insulation, WireProperties> selfT
 
         // 3) Unsided fallback only on explicitly enabled faces (we're already gated by isBlocked)
         fe = tile.getCapability(ForgeCapabilities.ENERGY, null).orElse(null);
-        if (fe != null && (fe.canReceive() || fe.canExtract())) {
-            if (!UNSIDED_FALLBACK_LOGGED) {
-                UNSIDED_FALLBACK_LOGGED = true;
-                org.apache.logging.log4j.LogManager.getLogger("GTCEuEnergyNetHotfix").info(
-                        "CableBlockMixin using UNSIDED FE fallback for neighbor {} (this is expected for some mods)",
-                        tile.getClass().getName()
-                );
-            }
-            return true;
-        }
+        if (fe != null && (fe.canReceive() || fe.canExtract())) return true;
         return false;
     }
 }

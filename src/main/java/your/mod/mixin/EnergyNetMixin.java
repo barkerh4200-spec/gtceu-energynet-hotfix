@@ -16,6 +16,7 @@ import org.spongepowered.asm.mixin.injection.Inject;
 import org.spongepowered.asm.mixin.injection.callback.CallbackInfoReturnable;
 import your.mod.energy.EndpointChangeTracker;
 import your.mod.energy.HandlerCache;
+import your.mod.energy.SinkCache;
 
 import java.util.List;
 import java.util.Map;
@@ -71,6 +72,7 @@ public abstract class EnergyNetMixin {
             // One global invalidation per tick per net, then rebuild lazily per pipePos.
             NET_DATA.clear();
             HandlerCache.clear(self);
+            SinkCache.clear(self);
             gtceuHotfixLastGlobalClearTick = tick;
             gtceuHotfixDirty = false;
         }
@@ -107,6 +109,14 @@ public abstract class EnergyNetMixin {
         // This captures real endpoint add/remove/replace without reacting to noisy neighbor updates.
         BlockEntity be = level.getBlockEntity(fromPos);
         if (EndpointChangeTracker.didBlockEntityChange(self, fromPos, be)) {
+            gtceuHotfixDirty = true;
+        }
+
+        // Also mark dirty when a cable block entity is the source of the update.
+        // Connection toggles (e.g. wire cutters) mutate topology without changing BE identity,
+        // but routes/sinks must be rebuilt so newly attached endpoints (including FE sinks)
+        // are discovered.
+        if (be instanceof CableBlockEntity) {
             gtceuHotfixDirty = true;
         }
     }

@@ -5,132 +5,126 @@ import com.gregtechceu.gtceu.api.capability.compat.FeCompat;
 import net.minecraft.core.Direction;
 import net.minecraftforge.energy.IEnergyStorage;
 
-import java.util.concurrent.atomic.AtomicInteger;
-
 /**
- * Forge Energy -> GTCEu IEnergyContainer adapter with buffered down-conversion.
+ * Forge Energy -> GTCEu IEnergyContainer adapter.
  *
- * This class is only used when the EnergyNet actually decides a neighbour is an endpoint and
- * wraps it as an IEnergyContainer via GTCapabilityHelperMixin.
- *
- * Debugging:
- *  - Logs wrapper creation for the first few instances so we can prove wrapping happens on IV/LuV networks.
+ * Important: amperage consumption is derived from FE actually inserted this tick (matching GTCEu's EUToFEProvider),
+ * not from maxReceive. A small internal FE remainder buffer ensures that if a sink cannot accept a full GT packet
+ * worth of FE in one tick, no energy is lost and high-tier networks still work.
  */
 public final class FeEnergyContainerWrapper implements IEnergyContainer {
 
-    private static final AtomicInteger CREATED_LOG_COUNT = new AtomicInteger(0);
-    private static final int MAX_CREATE_LOGS = 20;
-
-    private static boolean ACTIVE_LOGGED = false;
-    private static boolean HIGH_VOLT_WARN_LOGGED = false;
-
     private final IEnergyStorage energyStorage;
-    private final int maxReceiveFePerTick;
 
-    /** Buffered energy in EU awaiting conversion to FE. */
-    private long euBuffer = 0L;
+    /** Internal remainder buffer, in FE units. */
+    private long feBuffer;
 
-    /** About 40 ticks (2 seconds) worth of input buffering. */
-    private final long maxEuBuffer;
+    public FeEnergyContainerWrapper(IEnergyStorage storage) {
+        this.energyStorage = storage;
+    }
 
-    public FeEnergyContainerWrapper(IEnergyStorage energyStorage) {
-        this.energyStorage = energyStorage;
-
-        if (energyStorage.canReceive()) {
-            this.maxReceiveFePerTick = Math.max(0, energyStorage.receiveEnergy(Integer.MAX_VALUE, true));
-        } else {
-            this.maxReceiveFePerTick = 0;
-        }
-
-        final int ratio = FeCompat.ratio(false);
-        long maxEuPerTick = FeCompat.toEu(this.maxReceiveFePerTick, ratio);
-        if (maxEuPerTick <= 0) {
-            this.maxEuBuffer = 0L;
-        } else {
-            this.maxEuBuffer = Math.max(1L, maxEuPerTick * 40L);
-        }
-
-        int n = CREATED_LOG_COUNT.getAndIncrement();
-        if (n < MAX_CREATE_LOGS) {
-}
+    private static int satCast(long v) {
+        if (v <= 0) return 0;
+        if (v >= Integer.MAX_VALUE) return Integer.MAX_VALUE;
+        return (int) v;
     }
 
     @Override
     public long acceptEnergyFromNetwork(Direction facing, long voltage, long amperage) {
-        if (!ACTIVE_LOGGED) {
-            ACTIVE_LOGGED = true;
-}
-
-        if (amperage <= 0 || voltage <= 0) return 0;
-        if (!energyStorage.canReceive()) return 0;
-        if (maxEuBuffer <= 0) return 0;
-
+        if (energyStorage == null || !energyStorage.canReceive()) return 0;
         final int ratio = FeCompat.ratio(false);
+        final long maxPacketFe = FeCompat.toFeLong(voltage, ratio);
+        if (maxPacketFe <= 0 || amperage <= 0 || voltage <= 0) return 0;
 
-        // Warn (once) when a single GT packet at this voltage exceeds FE throughput.
-        final long packetFe = FeCompat.toFeLong(voltage, ratio);
-        if (!HIGH_VOLT_WARN_LOGGED && maxReceiveFePerTick > 0 && packetFe > (long) maxReceiveFePerTick) {
-            HIGH_VOLT_WARN_LOGGED = true;
-}
+        final long maximalValue = maxPacketFe * amperage;
 
-        // Drain existing buffer into FE for this tick.
-        drainBufferToFe(ratio);
+        int receiveFromBuffer = 0;
 
-        long space = maxEuBuffer - euBuffer;
-        if (space <= 0) return 0;
+        // Try to use internal buffer first
+        if (feBuffer > 0) {
+            int can = energyStorage.receiveEnergy(satCast(feBuffer), true);
+            if (can == 0) return 0;
 
-        long maxAmpsBySpace = space / voltage;
-        if (maxAmpsBySpace <= 0) return 0;
-
-        long acceptedAmps = Math.min(amperage, maxAmpsBySpace);
-        if (acceptedAmps <= 0) return 0;
-
-        // Accept EU into buffer (EnergyNet removes this EU from the network immediately).
-        euBuffer += acceptedAmps * voltage;
-
-        // Drain again after buffering.
-        drainBufferToFe(ratio);
-
-        return acceptedAmps;
-    }
-
-    private void drainBufferToFe(int ratio) {
-        if (euBuffer <= 0) return;
-        if (maxReceiveFePerTick <= 0) return;
-
-        long wantFeLong = FeCompat.toFeLong(euBuffer, ratio);
-        if (wantFeLong <= 0) return;
-
-        int wantFe = (int) Math.min((long) Integer.MAX_VALUE, Math.min((long) maxReceiveFePerTick, wantFeLong));
-
-        // Align to ratio boundary to avoid conversion loss.
-        int aligned = wantFe - (wantFe % ratio);
-        if (aligned <= 0) return;
-
-        int sim = energyStorage.receiveEnergy(aligned, true);
-        if (sim <= 0) return;
-
-        int simAligned = sim - (sim % ratio);
-        if (simAligned <= 0) return;
-
-        int received = energyStorage.receiveEnergy(simAligned, false);
-        if (received <= 0) return;
-
-        long deliveredEu = FeCompat.toEu(received, ratio);
-        if (deliveredEu > 0) {
-            euBuffer = Math.max(0L, euBuffer - deliveredEu);
+            if (feBuffer > can) {
+                int inserted = energyStorage.receiveEnergy(can, false);
+                feBuffer -= inserted;
+                return 0;
+            } else {
+                receiveFromBuffer = satCast(feBuffer);
+            }
         }
+
+        if (receiveFromBuffer != 0) {
+            int consumable = energyStorage.receiveEnergy(satCast(maximalValue + (long) receiveFromBuffer), true);
+            if (consumable == 0) return 0;
+
+            consumable = energyStorage.receiveEnergy(consumable, false);
+
+            if ((long) consumable <= (long) receiveFromBuffer) {
+                feBuffer = (long) receiveFromBuffer - (long) consumable;
+                return 0;
+            }
+
+            long newPower = (long) consumable - (long) receiveFromBuffer;
+
+            if (newPower % maxPacketFe == 0) {
+                feBuffer = 0;
+                return newPower / maxPacketFe;
+            }
+
+            long ampsToConsume = (newPower / maxPacketFe) + 1;
+            feBuffer = (maxPacketFe * ampsToConsume) - newPower;
+            return ampsToConsume;
+        }
+
+        int consumable = energyStorage.receiveEnergy(satCast(maximalValue), true);
+        if (consumable == 0) return 0;
+
+        consumable = energyStorage.receiveEnergy(consumable, false);
+
+        if ((long) consumable % maxPacketFe == 0) {
+            feBuffer = 0;
+            return (long) consumable / maxPacketFe;
+        }
+
+        long ampsToConsume = ((long) consumable / maxPacketFe) + 1;
+        feBuffer = (maxPacketFe * ampsToConsume) - (long) consumable;
+        return ampsToConsume;
     }
 
     @Override
     public boolean inputsEnergy(Direction facing) {
-        return energyStorage.canReceive();
+        return energyStorage != null && energyStorage.canReceive();
     }
 
     @Override
-    public long getInputVoltage() {
-        // Buffer can accept any voltage; gating is via buffer capacity.
-        return Long.MAX_VALUE;
+    public boolean outputsEnergy(Direction facing) {
+        return false;
+    }
+
+    @Override
+    public long changeEnergy(long differenceAmount) {
+        // Not used by GTCEu EnergyNet delivery for endpoints; keep as no-op.
+        return 0;
+    }
+
+    @Override
+    public long getEnergyCanBeInserted() {
+        if (energyStorage == null) return 0;
+        int space = Math.max(0, energyStorage.getMaxEnergyStored() - energyStorage.getEnergyStored());
+        return FeCompat.toEu(space, FeCompat.ratio(false));
+    }
+
+    @Override
+    public long getEnergyStored() {
+        if (energyStorage == null) return 0;
+        return FeCompat.toEu(energyStorage.getEnergyStored(), FeCompat.ratio(false));
+    }
+
+    @Override
+    public long getEnergyCapacity() {
+        if (energyStorage == null) return 0;
+        return FeCompat.toEu(energyStorage.getMaxEnergyStored(), FeCompat.ratio(false));
     }
 
     @Override
@@ -139,36 +133,8 @@ public final class FeEnergyContainerWrapper implements IEnergyContainer {
     }
 
     @Override
-    public long getEnergyCanBeInserted() {
-        final int ratio = FeCompat.ratio(false);
-        long spaceEuByBuffer = Math.max(0L, maxEuBuffer - euBuffer);
-
-        int maxFe = energyStorage.getMaxEnergyStored();
-        int curFe = energyStorage.getEnergyStored();
-        int spaceFe = Math.max(0, maxFe - curFe);
-        long spaceEuByStorage = FeCompat.toEu(spaceFe, ratio);
-
-        // Conservative to avoid the net trying to dump insane amounts into a slow FE sink.
-        return spaceEuByBuffer + Math.min(spaceEuByStorage, spaceEuByBuffer);
-    }
-
-    @Override
-    public long getEnergyStored() {
-        final int ratio = FeCompat.ratio(false);
-        long feEu = FeCompat.toEu(energyStorage.getEnergyStored(), ratio);
-        return feEu + euBuffer;
-    }
-
-    @Override
-    public long getEnergyCapacity() {
-        final int ratio = FeCompat.ratio(false);
-        long feCapEu = FeCompat.toEu(energyStorage.getMaxEnergyStored(), ratio);
-        return feCapEu + maxEuBuffer;
-    }
-
-    @Override
-    public long changeEnergy(long differenceAmount) {
-        // Not used in our EnergyNet path.
-        return 0;
+    public long getInputVoltage() {
+        // Unlimited so high-tier networks attempt delivery.
+        return inputsEnergy(null) ? Long.MAX_VALUE : 0;
     }
 }

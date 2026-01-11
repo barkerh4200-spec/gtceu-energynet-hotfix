@@ -2,7 +2,6 @@ package your.mod.mixin;
 
 import com.gregtechceu.gtceu.api.capability.IEnergyContainer;
 import com.gregtechceu.gtceu.api.capability.compat.FeCompat;
-import com.gregtechceu.gtceu.api.capability.compat.EUToFEProvider;
 import net.minecraft.core.Direction;
 import net.minecraftforge.energy.IEnergyStorage;
 import org.spongepowered.asm.mixin.Mixin;
@@ -12,183 +11,167 @@ import org.spongepowered.asm.mixin.Unique;
 import java.lang.reflect.Field;
 
 /**
- * Fix high-tier (IV/LuV+) EU -> FE delivery for FE sinks wrapped by GTCEu's built-in EUToFEProvider$GTEnergyWrapper.
+ * Fix high-tier (IV/LuV+) EU -> FE delivery for FE sinks wrapped by GTCEu's built-in
+ * EUToFEProvider$GTEnergyWrapper.
  *
- * Observed: EnergyNetWalker discovers AE2 Controller endpoints using EUToFEProvider$GTEnergyWrapper,
- * not our custom wrapper. On IV/LuV networks, those endpoints receive 0 FE.
- *
- * Root cause (likely): packet-based voltage gating + FE throughput mismatch. EnergyNet may refuse to
- * deliver if getInputVoltage() is too low, and/or acceptEnergyFromNetwork() only counts whole packets.
- *
- * This mixin:
- *  - Treats FE as continuous by buffering EU internally and drip-feeding FE at the sink's throughput.
- *  - Returns accepted amps based on buffered EU (energy conserved).
- *  - Advertises effectively unlimited input voltage so the net will attempt delivery even on high tiers.
- *
- * No per-tick world scanning is introduced; logic only runs when the net calls acceptEnergyFromNetwork().
+ * Key properties:
+ * - Does NOT base amperage consumption on maxReceive; amps consumed are derived from FE actually inserted this tick
+ *   (matching GTCEu's original EUToFEProvider logic).
+ * - Supports "packet splitting" via an internal FE remainder buffer so sinks with maxReceive < one GT packet
+ *   still accept energy at high tiers.
+ * - Advertises effectively unlimited input voltage so high-tier networks attempt delivery.
  */
-@Mixin(value = EUToFEProvider.GTEnergyWrapper.class, remap = false)
-public abstract class EUToFEGTEnergyWrapperMixin {
+@Mixin(value = com.gregtechceu.gtceu.api.capability.compat.EUToFEProvider.GTEnergyWrapper.class, remap = false)
+public abstract class EUToFEGTEnergyWrapperMixin implements IEnergyContainer {
 
-    @Unique private static boolean LOG_ACTIVE = false;
-    @Unique private static boolean LOG_BUFFERING_WARN = false;
+    @Unique
+    private static final Field GTCEU_HOTFIX$ENERGY_STORAGE_FIELD = gtceuHotfix$findEnergyStorageField();
 
-    @Unique private boolean gtceuHotfix$init = false;
-    @Unique private IEnergyStorage gtceuHotfix$storage = null;
-    @Unique private int gtceuHotfix$maxReceiveFePerTick = 0;
-    @Unique private long gtceuHotfix$euBuffer = 0L;
-    @Unique private long gtceuHotfix$maxEuBuffer = 0L;
+    @Unique
+    private static Field gtceuHotfix$findEnergyStorageField() {
+        try {
+            Field f = com.gregtechceu.gtceu.api.capability.compat.EUToFEProvider.GTEnergyWrapper.class
+                    .getDeclaredField("energyStorage");
+            f.setAccessible(true);
+            return f;
+        } catch (Throwable t) {
+            return null;
+        }
+    }
 
     @Unique
     private IEnergyStorage gtceuHotfix$getStorage() {
-        if (gtceuHotfix$storage != null) return gtceuHotfix$storage;
-
-        // Reflectively locate the first IEnergyStorage field on this wrapper.
-        // This avoids depending on GTCEu private field names across versions.
+        if (GTCEU_HOTFIX$ENERGY_STORAGE_FIELD == null) return null;
         try {
-            Class<?> c = this.getClass();
-            while (c != null && c != Object.class) {
-                for (Field f : c.getDeclaredFields()) {
-                    if (IEnergyStorage.class.isAssignableFrom(f.getType())) {
-                        f.setAccessible(true);
-                        Object v = f.get(this);
-                        if (v instanceof IEnergyStorage) {
-                            gtceuHotfix$storage = (IEnergyStorage) v;
-                            return gtceuHotfix$storage;
-                        }
-                    }
-                }
-                c = c.getSuperclass();
-            }
-        } catch (Throwable ignored) {}
-
-        return null;
-    }
-
-    @Unique
-    private void gtceuHotfix$ensureInit() {
-        if (gtceuHotfix$init) return;
-        gtceuHotfix$init = true;
-
-        IEnergyStorage s = gtceuHotfix$getStorage();
-        if (s != null && s.canReceive()) {
-            try {
-                gtceuHotfix$maxReceiveFePerTick = Math.max(0, s.receiveEnergy(Integer.MAX_VALUE, true));
-            } catch (Throwable ignored) {
-                gtceuHotfix$maxReceiveFePerTick = 0;
-            }
-
-            int ratio = FeCompat.ratio(false);
-            long maxEuPerTick = FeCompat.toEu(gtceuHotfix$maxReceiveFePerTick, ratio);
-            if (maxEuPerTick > 0) {
-                gtceuHotfix$maxEuBuffer = Math.max(1L, maxEuPerTick * 40L); // ~2s buffer
-            } else {
-                gtceuHotfix$maxEuBuffer = 0L;
-            }
-        }
-    }
-
-    @Unique
-    private void gtceuHotfix$drainBufferToFe(int ratio) {
-        if (gtceuHotfix$euBuffer <= 0) return;
-        if (gtceuHotfix$maxReceiveFePerTick <= 0) return;
-
-        IEnergyStorage s = gtceuHotfix$getStorage();
-        if (s == null || !s.canReceive()) return;
-
-        long wantFeLong = FeCompat.toFeLong(gtceuHotfix$euBuffer, ratio);
-        if (wantFeLong <= 0) return;
-
-        int wantFe = (int) Math.min((long) Integer.MAX_VALUE,
-                Math.min((long) gtceuHotfix$maxReceiveFePerTick, wantFeLong));
-
-        int aligned = wantFe - (wantFe % ratio);
-        if (aligned <= 0) return;
-
-        int sim = s.receiveEnergy(aligned, true);
-        if (sim <= 0) return;
-
-        int simAligned = sim - (sim % ratio);
-        if (simAligned <= 0) return;
-
-        int received = s.receiveEnergy(simAligned, false);
-        if (received <= 0) return;
-
-        long deliveredEu = FeCompat.toEu(received, ratio);
-        if (deliveredEu > 0) {
-            gtceuHotfix$euBuffer = Math.max(0L, gtceuHotfix$euBuffer - deliveredEu);
+            return (IEnergyStorage) GTCEU_HOTFIX$ENERGY_STORAGE_FIELD.get(this);
+        } catch (Throwable t) {
+            return null;
         }
     }
 
     /**
-     * @author hotfix
-     * @reason Make IV/LuV+ networks power FE sinks by buffering EU then drip-feeding FE at sink throughput.
+     * Internal FE remainder buffer (in FE units).
+     * This is the same idea as GTCEu's original EUToFEProvider: if a sink can only accept part of a GT packet
+     * worth of FE, we buffer the remainder so no energy is lost, and amperage consumption remains consistent.
+     */
+    @Unique
+    private long gtceuHotfix$feBuffer;
+
+    @Unique
+    private static int gtceuHotfix$satCast(long v) {
+        if (v <= 0) return 0;
+        if (v >= Integer.MAX_VALUE) return Integer.MAX_VALUE;
+        return (int) v;
+    }
+
+    /**
+     * Overwrite to match GTCEu's original semantics:
+     * - amps consumed are based on FE inserted this tick (plus at most +1 amp for partial-packet remainder buffering),
+     *   NOT based on buffer capacity or maxReceive alone.
+     * - buffer is used to prevent packet loss on conversion.
+     * @author GTCEuEnergyNetHotfix
+     * @reason Match GTCEu EU→FE behavior while buffering remainder and charging amps only for FE actually inserted this tick.
      */
     @Overwrite
     public long acceptEnergyFromNetwork(Direction facing, long voltage, long amperage) {
-        gtceuHotfix$ensureInit();
-
-        if (!LOG_ACTIVE) {
-            LOG_ACTIVE = true;
-}
-
-        if (amperage <= 0 || voltage <= 0) return 0;
-
         IEnergyStorage s = gtceuHotfix$getStorage();
         if (s == null || !s.canReceive()) return 0;
 
-        if (gtceuHotfix$maxEuBuffer <= 0) return 0;
-
         final int ratio = FeCompat.ratio(false);
+        final long maxPacketFe = FeCompat.toFeLong(voltage, ratio);
+        if (maxPacketFe <= 0 || amperage <= 0 || voltage <= 0) return 0;
 
-        // Log once when a single packet is bigger than sink throughput (the stall condition).
-        long packetFe = FeCompat.toFeLong(voltage, ratio);
-        if (!LOG_BUFFERING_WARN && gtceuHotfix$maxReceiveFePerTick > 0 && packetFe > (long) gtceuHotfix$maxReceiveFePerTick) {
-            LOG_BUFFERING_WARN = true;
-}
+        final long maximalValue = maxPacketFe * amperage;
 
-        // Drain existing buffer first
-        gtceuHotfix$drainBufferToFe(ratio);
+        int receiveFromBuffer = 0;
 
-        // Accept EU into buffer, limited by buffer space
-        long space = gtceuHotfix$maxEuBuffer - gtceuHotfix$euBuffer;
-        if (space <= 0) return 0;
+        // Try to use the internal buffer before consuming a new packet
+        if (gtceuHotfix$feBuffer > 0) {
+            int can = s.receiveEnergy(gtceuHotfix$satCast(gtceuHotfix$feBuffer), true);
+            if (can == 0) return 0;
 
-        long maxAmpsBySpace = space / voltage;
-        if (maxAmpsBySpace <= 0) return 0;
+            // Buffer could provide only part of what the sink can accept this tick; consume part of buffer only
+            if (gtceuHotfix$feBuffer > can) {
+                int inserted = s.receiveEnergy(can, false);
+                gtceuHotfix$feBuffer -= inserted;
+                return 0;
+            } else {
+                // Buffer can be fully consumed; include it in the combined insertion below
+                receiveFromBuffer = gtceuHotfix$satCast(gtceuHotfix$feBuffer);
+            }
+        }
 
-        long acceptedAmps = Math.min(amperage, maxAmpsBySpace);
-        if (acceptedAmps <= 0) return 0;
+        // Consume buffer remainder + new packet energy in a single insertion
+        if (receiveFromBuffer != 0) {
+            int consumable = s.receiveEnergy(gtceuHotfix$satCast(maximalValue + (long) receiveFromBuffer), true);
+            if (consumable == 0) return 0;
 
-        gtceuHotfix$euBuffer += acceptedAmps * voltage;
+            consumable = s.receiveEnergy(consumable, false);
 
-        // Drain again after buffering
-        gtceuHotfix$drainBufferToFe(ratio);
+            // Only able to consume less than our buffered amount
+            if ((long) consumable <= (long) receiveFromBuffer) {
+                gtceuHotfix$feBuffer = (long) receiveFromBuffer - (long) consumable;
+                return 0;
+            }
 
-        return acceptedAmps;
+            long newPower = (long) consumable - (long) receiveFromBuffer;
+
+            // Able to consume buffered amount plus an even amount of packets
+            if (newPower % maxPacketFe == 0) {
+                gtceuHotfix$feBuffer = 0;
+                return newPower / maxPacketFe;
+            }
+
+            // Able to consume buffered amount plus some remainder inside the last packet
+            long ampsToConsume = (newPower / maxPacketFe) + 1;
+            gtceuHotfix$feBuffer = (maxPacketFe * ampsToConsume) - newPower;
+            return ampsToConsume;
+        }
+
+        // No buffer: try to draw up to amperage packets worth of FE
+        int consumable = s.receiveEnergy(gtceuHotfix$satCast(maximalValue), true);
+        if (consumable == 0) return 0;
+
+        consumable = s.receiveEnergy(consumable, false);
+
+        if ((long) consumable % maxPacketFe == 0) {
+            gtceuHotfix$feBuffer = 0;
+            return (long) consumable / maxPacketFe;
+        }
+
+        long ampsToConsume = ((long) consumable / maxPacketFe) + 1;
+        gtceuHotfix$feBuffer = (maxPacketFe * ampsToConsume) - (long) consumable;
+        return ampsToConsume;
     }
 
     /**
-     * @author hotfix
-     * @reason FE sinks are not voltage-tiered; allow the net to attempt delivery at any tier (buffering handles throughput).
+     * Advertise essentially unlimited input voltage so IV/LuV+ networks will still attempt delivery.
+     * The acceptEnergyFromNetwork implementation buffers FE remainder so no energy is lost even if the sink
+     * can't accept a whole high-tier packet in a single tick.
+     * @author GTCEuEnergyNetHotfix
+     * @reason Allow high-tier networks to attempt delivery; actual insertion is capped by FE throughput and buffered remainder.
      */
     @Overwrite
     public long getInputVoltage() {
+        IEnergyStorage s = gtceuHotfix$getStorage();
+        if (s == null || !s.canReceive()) return 0;
         return Long.MAX_VALUE;
     }
 
     /**
-     * @author hotfix
-     * @reason FE sinks are not amperage-tiered; buffering and FE throughput clamp effective intake.
+     * @author GTCEuEnergyNetHotfix
+     * @reason Expose an effectively unbounded amperage to allow the network to offer amps; acceptance is limited per tick by FE insertion.
      */
     @Overwrite
     public long getInputAmperage() {
+        IEnergyStorage s = gtceuHotfix$getStorage();
+        if (s == null || !s.canReceive()) return 0;
         return Long.MAX_VALUE;
     }
 
     /**
-     * @author hotfix
-     * @reason Delegate to FE storage.
+     * @author GTCEuEnergyNetHotfix
+     * @reason This wrapper represents an FE sink, so it is always considered an input on any queried face.
      */
     @Overwrite
     public boolean inputsEnergy(Direction facing) {
@@ -197,13 +180,65 @@ public abstract class EUToFEGTEnergyWrapperMixin {
     }
 
     /**
-     * @author hotfix
-     * @reason Improve routing heuristics by exposing buffer space (EU) as insertable capacity.
+     * @author GTCEuEnergyNetHotfix
+     * @reason This wrapper never outputs EU back into the network.
+     */
+    @Overwrite
+    public boolean outputsEnergy(Direction facing) {
+        return false;
+    }
+
+    /**
+     * @author GTCEuEnergyNetHotfix
+     * @reason Support internal buffer adjustments in EU units by translating to FE storage operations with ratio alignment.
+     */
+    @Overwrite
+    public long changeEnergy(long differenceAmount) {
+        // Keep original behaviour: this wrapper is a sink adapter; direct delta changes are unsupported here.
+        return 0;
+    }
+
+    /**
+     * @author GTCEuEnergyNetHotfix
+     * @reason Report stored energy in EU units based on the wrapped FE storage.
+     */
+    @Overwrite
+    public long getEnergyStored() {
+        IEnergyStorage s = gtceuHotfix$getStorage();
+        if (s == null) return 0;
+        return FeCompat.toEu(s.getEnergyStored(), FeCompat.ratio(false));
+    }
+
+    /**
+     * @author GTCEuEnergyNetHotfix
+     * @reason Report capacity in EU units based on the wrapped FE storage.
+     */
+    @Overwrite
+    public long getEnergyCapacity() {
+        IEnergyStorage s = gtceuHotfix$getStorage();
+        if (s == null) return 0;
+        return FeCompat.toEu(s.getMaxEnergyStored(), FeCompat.ratio(false));
+    }
+
+    /**
+     * @author GTCEuEnergyNetHotfix
+     * @reason Allow high-tier EU packets to be buffered (GTCEu semantics).
+     *
+     * The wrapped FE sink often cannot accept a full packet worth of FE in a single tick.
+     * GTCEu's wrapper is expected to buffer the remainder and drip-feed it over subsequent
+     * ticks. If we report "insertable" strictly from FE storage headroom, the energy net
+     * treats the endpoint as unable to accept even a single EU packet (e.g. LuV packets)
+     * and drops it from the sink list, causing FE blocks (AE2 ME Controller) to stay offline.
      */
     @Overwrite
     public long getEnergyCanBeInserted() {
-        gtceuHotfix$ensureInit();
-        if (gtceuHotfix$maxEuBuffer <= 0) return 0;
-        return Math.max(0L, gtceuHotfix$maxEuBuffer - gtceuHotfix$euBuffer);
+        IEnergyStorage s = gtceuHotfix$getStorage();
+        if (s == null) return 0;
+        if (!s.canReceive()) return 0;
+
+        // "Very large" so sink validation (euSpace >= voltage) won't filter out the endpoint.
+        // Actual throughput + amperage drain is still governed by acceptEnergyFromNetwork(),
+        // which is based on the real amount inserted into FE this tick.
+        return Long.MAX_VALUE / 4;
     }
 }

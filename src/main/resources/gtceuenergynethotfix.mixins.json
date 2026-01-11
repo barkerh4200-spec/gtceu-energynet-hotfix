@@ -5,12 +5,15 @@
   "compatibilityLevel": "JAVA_17",
   "refmap": "gtceuenergynethotfix.refmap.json",
   "mixins": [
-    "EnergyNetHandlerMixin",
-    "EnergyNetMixin",
+    "CableBlockMixin",
     "GTCapabilityHelperMixin",
     "EnergyNetWalkerMixin",
-    "CableBlockMixin",
-    "EUToFEGTEnergyWrapperMixin"
+    "EnergyRoutePathSegmentMixin",
+    "EUToFEGTEnergyWrapperMixin",
+    "CableBlockEntityAverageAmperageMixin",
+    "EnergyNetHandlerMixin",
+    "EnergyNetMixin",
+    "EnergyNetWalkerStatsMixin"
   ],
   "client": [],
   "server": []

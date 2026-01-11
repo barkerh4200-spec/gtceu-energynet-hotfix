@@ -1,41 +1,96 @@
 package your.mod.mixin;
 
-import com.gregtechceu.gtceu.api.capability.GTCapabilityHelper;
 import com.gregtechceu.gtceu.api.capability.IEnergyContainer;
-import com.gregtechceu.gtceu.common.pipelike.cable.EnergyNetWalker;
+import com.gregtechceu.gtceu.api.capability.forge.GTCapability;
+import com.gregtechceu.gtceu.api.data.chemical.material.properties.WireProperties;
+import com.gregtechceu.gtceu.common.blockentity.CableBlockEntity;
+import com.gregtechceu.gtceu.common.pipelike.cable.EnergyRoutePath;
 import net.minecraft.core.BlockPos;
 import net.minecraft.core.Direction;
-import net.minecraft.world.level.Level;
+import net.minecraft.world.level.block.entity.BlockEntity;
+import net.minecraftforge.common.capabilities.Capability;
+import net.minecraftforge.common.util.LazyOptional;
+import net.minecraftforge.energy.IEnergyStorage;
+import net.minecraftforge.common.capabilities.ForgeCapabilities;
 import org.spongepowered.asm.mixin.Mixin;
-import org.spongepowered.asm.mixin.Unique;
 import org.spongepowered.asm.mixin.injection.At;
 import org.spongepowered.asm.mixin.injection.Redirect;
+import your.mod.energy.FeEnergyContainerWrapper;
+import your.mod.energy.IRouteSegmentData;
 
 /**
- * Preserve GTCEu's original route building and loss computation (especially for superconductors),
- * while ensuring endpoint discovery uses GTCapabilityHelper.getEnergyContainer(...).
- *
- * Our GTCapabilityHelper mixin extends that helper to wrap Forge Energy storages as IEnergyContainer,
- * so FE neighbors become valid endpoints without rewriting EnergyNetWalker's logic.
+ * Surgical hook: keep GTCEu's EnergyNetWalker logic intact (including loss computation),
+ * but allow FE-only endpoints (ForgeCapabilities.ENERGY / IEnergyStorage) to be treated as EU sinks
+ * by returning a wrapped IEnergyContainer when GT's energy container capability is absent.
  */
-@Mixin(value = EnergyNetWalker.class, remap = false)
+@Mixin(value = com.gregtechceu.gtceu.common.pipelike.cable.EnergyNetWalker.class, remap = false)
 public abstract class EnergyNetWalkerMixin {
 
-    @Unique private static boolean LOGGED = false;
+    /**
+     * Cache per-segment route data once at route creation time so EnergyNetHandler's hot path
+     * does not need to touch CableBlockEntity/node-data to compute max voltage and loss per block.
+     */
+    @Redirect(
+        method = "checkNeighbour",
+        at = @At(
+            value = "NEW",
+            target = "com/gregtechceu/gtceu/common/pipelike/cable/EnergyRoutePath"
+        )
+    )
+    private EnergyRoutePath gtceuHotfix$newEnergyRoutePath(BlockPos targetPipePos, Direction targetFacing,
+                                                          CableBlockEntity[] path, int distance, long maxLoss) {
+        final EnergyRoutePath route = new EnergyRoutePath(targetPipePos, targetFacing, path, distance, maxLoss);
+
+        final int n = (path == null) ? 0 : path.length;
+        final long[] posLong = new long[n];
+        final long[] maxV = new long[n];
+        final int[] loss = new int[n];
+
+        for (int i = 0; i < n; i++) {
+            final CableBlockEntity cable = path[i];
+            if (cable == null) continue;
+
+            posLong[i] = cable.getBlockPos().asLong();
+
+            // WireProperties holds both voltage rating and loss per block.
+            final WireProperties props = (WireProperties) cable.getNodeData();
+            if (props != null) {
+                maxV[i] = props.getVoltage();
+                loss[i] = props.getLossPerBlock();
+            }
+        }
+
+        ((IRouteSegmentData) route).gtceuHotfix$setSegmentData(posLong, maxV, loss);
+        return route;
+    }
 
     @Redirect(
-            method = "checkNeighbour",
-            at = @At(
-                    value = "INVOKE",
-                    target = "Lcom/gregtechceu/gtceu/api/capability/GTCapabilityHelper;getEnergyContainer(Lnet/minecraft/world/level/Level;Lnet/minecraft/core/BlockPos;Lnet/minecraft/core/Direction;)Lcom/gregtechceu/gtceu/api/capability/IEnergyContainer;"
-            )
+        method = "checkNeighbour",
+        at = @At(
+            value = "INVOKE",
+            target = "Lnet/minecraft/world/level/block/entity/BlockEntity;getCapability(Lnet/minecraftforge/common/capabilities/Capability;Lnet/minecraft/core/Direction;)Lnet/minecraftforge/common/util/LazyOptional;"
+        )
     )
-    private IEnergyContainer gtceuEnergyNetHotfix$redirectGetEnergyContainer(Level level, BlockPos pos, Direction side) {
-        if (!LOGGED) {
-            LOGGED = true;
-            org.apache.logging.log4j.LogManager.getLogger("GTCEuEnergyNetHotfix")
-                    .info("Mixin active: EnergyNetWalkerMixin (capability redirect; preserves loss computation)");
+    private LazyOptional<?> gtceuEutofe_redirectEnergyContainerCapability(BlockEntity be, Capability<?> cap, Direction side) {
+        // Preserve original behavior for all other capabilities.
+        LazyOptional<?> original = be.getCapability(cap, side);
+
+        // Only intervene when GTCEu is probing for the GT energy container and it is absent.
+        if (cap == GTCapability.CAPABILITY_ENERGY_CONTAINER && (original == null || !original.isPresent())) {
+            // Sided FE first
+            IEnergyStorage storage = be.getCapability(ForgeCapabilities.ENERGY, side).orElse(null);
+
+            // Unsided fallback if sided is absent (some mods expose FE unsided only)
+            if (storage == null) {
+                storage = be.getCapability(ForgeCapabilities.ENERGY, null).orElse(null);
+            }
+
+            if (storage != null) {
+                IEnergyContainer wrapped = new FeEnergyContainerWrapper(storage);
+                return LazyOptional.of(() -> wrapped);
+            }
         }
-        return GTCapabilityHelper.getEnergyContainer(level, pos, side);
+
+        return original;
     }
 }
